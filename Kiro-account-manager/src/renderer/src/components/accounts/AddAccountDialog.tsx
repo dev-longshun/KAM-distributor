@@ -284,8 +284,7 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
           interval: result.interval || 5
         })
 
-        // 打开浏览器（支持隐私模式）
-        window.api.openExternal(result.verificationUri, usePrivateMode)
+        // 主进程已在内嵌窗口中打开验证页面
 
         // 开始轮询
         startPolling(result.interval || 5)
@@ -322,8 +321,7 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
           interval: 3
         })
 
-        // 打开浏览器（支持隐私模式）
-        window.api.openExternal(result.authorizeUrl, usePrivateMode)
+        // 主进程已在内嵌窗口中打开 SSO 页面
 
         // 开始轮询（等待服务器回调自动完成 token 交换）
         startIamSsoPolling(3)
@@ -1024,10 +1022,10 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
                     <Button 
                       variant="outline" 
                       className="flex-1"
-                      onClick={() => window.api.openExternal(builderIdLoginData.verificationUri, usePrivateMode)}
+                      onClick={() => window.api.openLoginWindow(builderIdLoginData.verificationUri, 'AWS Builder ID Login')}
                     >
                       <ExternalLink className="h-4 w-4 mr-2" />
-                      {isEn ? 'Open Browser' : '重新打开浏览器'}
+                      {isEn ? 'Reopen Login Window' : '重新打开登录窗口'}
                     </Button>
                     <Button 
                       variant="destructive" 

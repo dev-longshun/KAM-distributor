@@ -335,6 +335,9 @@ interface KiroApi {
   // 取消 Builder ID 登录
   cancelBuilderIdLogin: () => Promise<{ success: boolean }>
 
+  // 在内嵌窗口中打开登录页面
+  openLoginWindow: (url: string, title?: string) => Promise<{ success: boolean }>
+
   // 启动 IAM Identity Center SSO 登录 (Authorization Code flow)
   startIamSsoLogin: (startUrl: string, region?: string) => Promise<{
     success: boolean

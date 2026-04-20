@@ -1,4 +1,4 @@
-import { app, shell, BrowserWindow, ipcMain, dialog, globalShortcut } from 'electron'
+import { app, shell, BrowserWindow, ipcMain, dialog, globalShortcut, session } from 'electron'
 import { autoUpdater } from 'electron-updater'
 import * as machineIdModule from './machineId'
 import { join } from 'path'
@@ -3542,10 +3542,33 @@ app.whenReady().then(async () => {
         expiresAt: Date.now() + expiresIn * 1000
       }
 
+      // 使用隔离 session 的 BrowserWindow 打开验证页面
+      const verifyUrl = verificationUriComplete || verificationUri
+      const partition = `oauth-builderid-${Date.now()}`
+      const oauthSession = session.fromPartition(partition)
+      const oauthWin = new BrowserWindow({
+        width: 900,
+        height: 700,
+        title: `AWS Builder ID Login`,
+        webPreferences: {
+          partition,
+          nodeIntegration: false,
+          contextIsolation: true,
+        },
+      })
+      oauthWin.setMenuBarVisibility(false)
+
+      // 窗口关闭时清理 session
+      oauthWin.on('closed', () => {
+        oauthSession.clearStorageData().catch(() => {})
+      })
+
+      oauthWin.loadURL(verifyUrl)
+
       return {
         success: true,
         userCode,
-        verificationUri: verificationUriComplete || verificationUri,
+        verificationUri: verifyUrl,
         expiresIn,
         interval
       }
@@ -3634,6 +3657,28 @@ app.whenReady().then(async () => {
   ipcMain.handle('cancel-builder-id-login', async () => {
     console.log('[Login] Cancelling Builder ID login...')
     currentLoginState = null
+    return { success: true }
+  })
+
+  // IPC: 在内嵌窗口中打开登录页面（用于重新打开验证页面等场景）
+  ipcMain.handle('open-login-window', async (_event, url: string, title: string = 'Login') => {
+    const partition = `oauth-reopen-${Date.now()}`
+    const oauthSession = session.fromPartition(partition)
+    const oauthWin = new BrowserWindow({
+      width: 900,
+      height: 700,
+      title,
+      webPreferences: {
+        partition,
+        nodeIntegration: false,
+        contextIsolation: true,
+      },
+    })
+    oauthWin.setMenuBarVisibility(false)
+    oauthWin.on('closed', () => {
+      oauthSession.clearStorageData().catch(() => {})
+    })
+    oauthWin.loadURL(url)
     return { success: true }
   })
 
@@ -3850,7 +3895,43 @@ app.whenReady().then(async () => {
         expiresAt: Date.now() + 600000
       }
 
-      // 返回授权 URL，前端会打开浏览器
+      // 使用隔离 session 的 BrowserWindow（每次干净的 cookie 环境）
+      const partition = `oauth-iamsso-${Date.now()}`
+      const oauthSession = session.fromPartition(partition)
+      const oauthWin = new BrowserWindow({
+        width: 900,
+        height: 700,
+        title: `Enterprise SSO Login`,
+        webPreferences: {
+          partition,
+          nodeIntegration: false,
+          contextIsolation: true,
+        },
+      })
+      oauthWin.setMenuBarVisibility(false)
+
+      // 监听导航：当浏览器跳转到回调 URL 时，本地 HTTP server 会处理，窗口可以关闭
+      const callbackPrefix = `http://127.0.0.1:${port}/oauth/callback`
+      const checkAndCloseOnCallback = (url: string) => {
+        if (url.startsWith(callbackPrefix)) {
+          // 回调已被本地 HTTP server 处理，延迟关闭窗口让 server 完成 token 交换
+          setTimeout(() => {
+            if (!oauthWin.isDestroyed()) oauthWin.close()
+          }, 1500)
+        }
+      }
+      oauthWin.webContents.on('will-redirect', (_ev, url) => checkAndCloseOnCallback(url))
+      oauthWin.webContents.on('will-navigate', (_ev, url) => checkAndCloseOnCallback(url))
+      oauthWin.webContents.on('did-navigate', (_ev, url) => checkAndCloseOnCallback(url))
+
+      // 窗口关闭时清理 session
+      oauthWin.on('closed', () => {
+        oauthSession.clearStorageData().catch(() => {})
+      })
+
+      oauthWin.loadURL(authorizeUrl)
+
+      // 返回成功（不再返回 authorizeUrl 让前端 openExternal，主进程已在内嵌窗口中打开）
       return {
         success: true,
         authorizeUrl,
@@ -3939,13 +4020,72 @@ app.whenReady().then(async () => {
     }
 
     const urlStr = loginUrl.toString()
-    console.log(`[Login] Opening browser for ${provider} login...`)
+    console.log(`[Login] Opening isolated BrowserWindow for ${provider} login...`)
 
-    // 根据是否使用隐私模式选择打开方式
-    if (usePrivateMode) {
-      openBrowserInPrivateMode(urlStr)
-    } else {
-      shell.openExternal(urlStr)
+    // 使用独立 session 的 BrowserWindow，每次 OAuth 都是干净的 cookie 环境
+    const partition = `oauth-${Date.now()}`
+    const oauthSession = session.fromPartition(partition)
+    const oauthWin = new BrowserWindow({
+      width: 900,
+      height: 700,
+      title: `Login with ${provider}`,
+      webPreferences: {
+        partition,
+        nodeIntegration: false,
+        contextIsolation: true,
+      },
+    })
+    oauthWin.setMenuBarVisibility(false)
+
+    // 拦截 kiro:// 协议重定向，提取 auth code
+    oauthWin.webContents.on('will-redirect', (_ev, redirectUrl) => {
+      if (redirectUrl.startsWith('kiro://')) {
+        handleOAuthCallback(redirectUrl)
+        oauthWin.close()
+      }
+    })
+    oauthWin.webContents.on('will-navigate', (_ev, navUrl) => {
+      if (navUrl.startsWith('kiro://')) {
+        _ev.preventDefault()
+        handleOAuthCallback(navUrl)
+        oauthWin.close()
+      }
+    })
+    // 有些 OAuth 流程通过新窗口请求跳转
+    oauthWin.webContents.setWindowOpenHandler(({ url: openUrl }) => {
+      if (openUrl.startsWith('kiro://')) {
+        handleOAuthCallback(openUrl)
+        oauthWin.close()
+      }
+      return { action: 'deny' }
+    })
+
+    oauthWin.loadURL(urlStr)
+
+    function handleOAuthCallback(url: string) {
+      try {
+        const cbUrl = new URL(url)
+        const code = cbUrl.searchParams.get('code')
+        const cbState = cbUrl.searchParams.get('state')
+        const error = cbUrl.searchParams.get('error')
+        if (error) {
+          console.log('[Login] Auth callback error:', error)
+          if (mainWindow) {
+            mainWindow.webContents.send('social-auth-callback', { error })
+            mainWindow.focus()
+          }
+          return
+        }
+        if (code && cbState && mainWindow) {
+          console.log('[Login] Auth callback received, code:', code.substring(0, 20) + '...')
+          mainWindow.webContents.send('social-auth-callback', { code, state: cbState })
+          mainWindow.focus()
+        }
+      } catch (e) {
+        console.error('[Login] Failed to parse OAuth callback URL:', e)
+      }
+      // 清理临时 session
+      oauthSession.clearStorageData().catch(() => {})
     }
 
     return {

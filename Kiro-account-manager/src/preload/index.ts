@@ -268,6 +268,11 @@ const api = {
     return ipcRenderer.invoke('cancel-builder-id-login')
   },
 
+  // 在内嵌窗口中打开登录页面
+  openLoginWindow: (url: string, title?: string): Promise<{ success: boolean }> => {
+    return ipcRenderer.invoke('open-login-window', url, title)
+  },
+
   // 启动 IAM Identity Center SSO 登录 (Authorization Code flow)
   startIamSsoLogin: (startUrl: string, region?: string): Promise<{
     success: boolean
