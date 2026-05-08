@@ -805,14 +805,27 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
       return normalized || 'Google'
     }
 
+    // 根据 idp 推导 authMethod 和 provider
+    const deriveAuthInfo = (idp: IdpType): { authMethod: 'IdC' | 'social'; provider: 'BuilderId' | 'Enterprise' | 'Github' | 'Google' } => {
+      switch (idp) {
+        case 'Github': return { authMethod: 'social', provider: 'Github' }
+        case 'BuilderId': return { authMethod: 'IdC', provider: 'BuilderId' }
+        case 'Enterprise': return { authMethod: 'IdC', provider: 'Enterprise' }
+        case 'Google':
+        default: return { authMethod: 'social', provider: 'Google' }
+      }
+    }
+
     for (const item of items) {
       try {
         const now = Date.now()
+        const idp = normalizeIdp(item.idp as string)
+        const { authMethod, provider } = deriveAuthInfo(idp)
 
         const account: Omit<Account, 'id' | 'createdAt' | 'isActive'> = {
           email: item.email,
           nickname: item.nickname,
-          idp: normalizeIdp(item.idp as string),
+          idp,
           credentials: {
             accessToken: item.accessToken || '',
             csrfToken: item.csrfToken || '',
@@ -820,7 +833,9 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
             clientId: item.clientId,
             clientSecret: item.clientSecret,
             region: item.region || 'us-east-1',
-            expiresAt: now + 3600 * 1000
+            expiresAt: now + 3600 * 1000,
+            authMethod,
+            provider
           },
           subscription: {
             type: 'Free'

@@ -22,6 +22,8 @@ export function AccountManager({ onBack }: AccountManagerProps): React.ReactNode
     accounts,
     importFromExportData,
     importAccounts,
+    batchCheckStatus,
+    batchRefreshTokens,
     selectedIds
   } = useAccountsStore()
 
@@ -86,11 +88,169 @@ export function AccountManager({ onBack }: AccountManagerProps): React.ReactNode
       if (format === 'json') {
         // JSON 格式：完整导出数据
         const data = JSON.parse(content)
-        if (data.version && data.accounts) {
-          const result = importFromExportData(data)
-          const skippedInfo = result.errors.find(e => e.id === 'skipped')
-          const skippedMsg = skippedInfo ? `，${skippedInfo.error}` : ''
-          alert(`导入完成：成功 ${result.success} 个${skippedMsg}`)
+        if (data.version && data.accounts && Array.isArray(data.accounts)) {
+          // 判断是否为 KAM 完整导出格式（账号含 subscription/usage/credentials.expiresAt）
+          const firstAccount = data.accounts[0]
+          const isFullKamFormat = firstAccount && (
+            firstAccount.subscription || firstAccount.usage || firstAccount.credentials?.expiresAt
+          )
+
+          if (isFullKamFormat) {
+            // KAM 自身完整导出格式
+            const result = importFromExportData(data)
+            const skippedInfo = result.errors.find(e => e.id === 'skipped')
+            const skippedMsg = skippedInfo ? `，${skippedInfo.error}` : ''
+            alert(`导入完成：成功 ${result.success} 个${skippedMsg}`)
+          } else {
+            // 第三方工具导出的带 version/accounts 结构但账号字段简化的格式
+            const items = data.accounts.map((item: Record<string, unknown>) => {
+              const creds = (item.credentials || {}) as Record<string, unknown>
+              const authMethod = (creds.authMethod as string) || 'social'
+              const provider = authMethod === 'social' ? 'Google' : 'BuilderId'
+              return {
+                email: (item.email as string) || '',
+                refreshToken: (creds.refreshToken as string) || '',
+                accessToken: (creds.accessToken as string) || undefined,
+                csrfToken: (creds.csrfToken as string) || undefined,
+                clientId: (creds.clientId as string) || undefined,
+                clientSecret: (creds.clientSecret as string) || undefined,
+                region: (creds.region as string) || undefined,
+                idp: (creds.provider as string) || provider,
+                nickname: (item.label as string) || (item.nickname as string) || undefined,
+              }
+            }).filter((item: { refreshToken: string }) => item.refreshToken)
+
+            if (items.length === 0) {
+              alert('未找到有效的账号数据（需要 refreshToken）')
+              return
+            }
+
+            const result = importAccounts(items)
+            const skippedInfo = result.errors.find(e => e.id === 'skipped')
+            const skippedMsg = skippedInfo ? `，${skippedInfo.error}` : ''
+            alert(`导入完成：成功 ${result.success} 个，失败 ${result.failed} 个${skippedMsg}`)
+          }
+        } else if (Array.isArray(data) && data.length > 0 && data[0].refreshToken) {
+          // 第三方工具导出的 JSON 数组格式
+          const firstItem = data[0]
+          const hasRichData = firstItem.usageData || firstItem.accessToken
+
+          if (hasRichData) {
+            // 丰富格式：含 usageData/accessToken/userId 等完整信息，映射为 KAM 完整格式
+            const mappedAccounts = data
+              .filter((item: Record<string, unknown>) => item.refreshToken)
+              .map((item: Record<string, unknown>) => {
+                const usageData = item.usageData as Record<string, unknown> | undefined
+                const usageBreakdownList = (usageData?.usageBreakdownList as Array<Record<string, unknown>>) || []
+                const breakdown = usageBreakdownList[0] || {}
+                const subscriptionInfo = (usageData?.subscriptionInfo as Record<string, unknown>) || {}
+                const authMethod = (item.authMethod as string) || 'social'
+                const provider = (item.provider as string) || (authMethod === 'social' ? 'Google' : 'BuilderId')
+
+                // 解析订阅类型
+                let subscriptionType = 'Free'
+                const subTitle = (subscriptionInfo.subscriptionTitle as string) || ''
+                const titleUpper = subTitle.toUpperCase()
+                if (titleUpper.includes('PRO+') || titleUpper.includes('PRO_PLUS')) {
+                  subscriptionType = 'Pro_Plus'
+                } else if (titleUpper.includes('PRO')) {
+                  subscriptionType = 'Pro'
+                } else if (titleUpper.includes('ENTERPRISE') || titleUpper.includes('POWER')) {
+                  subscriptionType = 'Enterprise'
+                } else if (titleUpper.includes('TEAMS')) {
+                  subscriptionType = 'Teams'
+                }
+
+                // 解析过期时间
+                let expiresAt = Date.now() + 3600 * 1000
+                if (item.expiresAt && typeof item.expiresAt === 'string') {
+                  const parsed = new Date(item.expiresAt.replace(/\//g, '-')).getTime()
+                  if (!isNaN(parsed)) expiresAt = parsed
+                }
+
+                const usageLimit = (breakdown.usageLimit as number) || (breakdown.usageLimitWithPrecision as number) || 1000
+                const currentUsage = (breakdown.currentUsage as number) || (breakdown.currentUsageWithPrecision as number) || 0
+
+                return {
+                  id: (item.id as string) || crypto.randomUUID(),
+                  email: (item.email as string) || '',
+                  nickname: (item.label as string) || (item.nickname as string) || undefined,
+                  idp: provider as 'Google' | 'Github' | 'BuilderId' | 'Enterprise',
+                  userId: (item.userId as string) || undefined,
+                  machineId: (item.machineId as string) || undefined,
+                  profileArn: (item.profileArn as string) || undefined,
+                  credentials: {
+                    accessToken: (item.accessToken as string) || '',
+                    csrfToken: '',
+                    refreshToken: (item.refreshToken as string) || '',
+                    clientId: (item.clientId as string) || undefined,
+                    clientSecret: (item.clientSecret as string) || undefined,
+                    region: (item.region as string) || 'us-east-1',
+                    expiresAt,
+                    authMethod: authMethod as 'IdC' | 'social',
+                    provider: provider as 'BuilderId' | 'Enterprise' | 'Github' | 'Google'
+                  },
+                  subscription: {
+                    type: subscriptionType as 'Free' | 'Pro' | 'Pro_Plus' | 'Enterprise' | 'Teams',
+                    title: subTitle || undefined,
+                    upgradeCapability: (subscriptionInfo.upgradeCapability as string) || undefined,
+                    overageCapability: (subscriptionInfo.overageCapability as string) || undefined,
+                    managementTarget: (subscriptionInfo.subscriptionManagementTarget as string) || undefined
+                  },
+                  usage: {
+                    current: currentUsage,
+                    limit: usageLimit,
+                    percentUsed: usageLimit > 0 ? currentUsage / usageLimit : 0,
+                    lastUpdated: Date.now(),
+                    nextResetDate: usageData?.nextDateReset
+                      ? new Date((usageData.nextDateReset as number) * 1000).toISOString()
+                      : undefined,
+                    resourceDetail: breakdown.resourceType ? {
+                      resourceType: breakdown.resourceType as string,
+                      displayName: breakdown.displayName as string,
+                      displayNamePlural: breakdown.displayNamePlural as string,
+                      currency: breakdown.currency as string,
+                      unit: breakdown.unit as string,
+                      overageRate: breakdown.overageRate as number,
+                      overageCap: breakdown.overageCap as number,
+                    } : undefined
+                  },
+                  tags: [],
+                  status: ((item.status as string) === 'active' ? 'active' : 'unknown') as 'active' | 'unknown',
+                  lastUsedAt: Date.now(),
+                  createdAt: Date.now()
+                }
+              })
+
+            const exportData = { version: '1.0.0', exportedAt: Date.now(), accounts: mappedAccounts, groups: [], tags: [] }
+            const result = importFromExportData(exportData)
+            const skippedInfo = result.errors.find(e => e.id === 'skipped')
+            const skippedMsg = skippedInfo ? `，${skippedInfo.error}` : ''
+            alert(`导入完成：成功 ${result.success} 个${skippedMsg}`)
+          } else {
+            // 简化格式：只有 refreshToken 等基本字段
+            const items = data.map((item: Record<string, unknown>) => ({
+              email: (item.email as string) || '',
+              refreshToken: (item.refreshToken as string) || '',
+              accessToken: (item.accessToken as string) || undefined,
+              csrfToken: (item.csrfToken as string) || undefined,
+              clientId: (item.clientId as string) || undefined,
+              clientSecret: (item.clientSecret as string) || undefined,
+              region: (item.region as string) || undefined,
+              idp: (item.provider as string) || (item.idp as string) || 'Google',
+              nickname: (item.label as string) || (item.nickname as string) || undefined,
+            })).filter((item: { email: string; refreshToken: string }) => item.refreshToken)
+
+            if (items.length === 0) {
+              alert('未找到有效的账号数据（需要 refreshToken）')
+              return
+            }
+
+            const result = importAccounts(items)
+            const skippedInfo = result.errors.find(e => e.id === 'skipped')
+            const skippedMsg = skippedInfo ? `，${skippedInfo.error}` : ''
+            alert(`导入完成：成功 ${result.success} 个，失败 ${result.failed} 个${skippedMsg}`)
+          }
         } else {
           alert('无效的 JSON 文件格式')
         }
@@ -151,6 +311,16 @@ export function AccountManager({ onBack }: AccountManagerProps): React.ReactNode
     } catch (e) {
       console.error('Import error:', e)
       alert('解析导入文件失败')
+    }
+
+    // 导入完成后，自动对 status=unknown 的账号先刷新 token 再检查状态（异步，不阻塞）
+    const unknownIds = Array.from(accounts.values())
+      .filter(a => a.status === 'unknown')
+      .map(a => a.id)
+    if (unknownIds.length > 0) {
+      batchRefreshTokens(unknownIds)
+        .then(() => batchCheckStatus(unknownIds))
+        .catch(() => {})
     }
   }
 
